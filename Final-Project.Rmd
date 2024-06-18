@@ -1,0 +1,832 @@
+---
+title: "Final-Project"
+author: "Silas Raye"
+date: "2023-11-28"
+output: html_document
+---
+
+# Project Overview:
+
+My project aims to predict the market prices of Magic: The Gathering (MTG) cards based on their in-game utility and attributes. This project not only aligns with my personal interests but also presents a unique opportunity to apply high-dimensional data analysis in a real-world context.
+
+### Data Source:
+
+To ensure the reliability and accessibility of my data, I plan to utilize datasets from [Scryfall](https://scryfall.com/docs/api/bulk-data), a comprehensive and regularly updated source for MTG card information. These datasets offer detailed insights into each card's attributes and, importantly, are readily available and well-structured for analysis.
+
+### Hypothesis:
+
+The underlying hypothesis of my project is that the market value of MTG cards is primarily influenced by their playability in the game. I intend to examine various factors, such as card type, abilities, and inclusion in online decklist, to determine their correlation with market pricing.
+
+### Methodology:
+
+Leveraging the high-dimensional nature of the dataset, I plan to apply the various methods we have learned including lasso regression, ridge regression, principal component regression, and partial least squares. This is, of course, a tentative list. I will have to see how well different methods perform on my actual data as the project progresses.
+
+### Significance:
+
+This project is not only a fascinating exploration into the intersection of data science and gaming but also has practical implications for players and collectors in understanding and predicting market trends.
+
+![](https://rkeisling.github.io/pictures/mtg-anatomy.jpeg)
+
+```{r import_librarys, include=FALSE}
+library(jsonlite)
+library(dplyr)
+library(tidytext)
+library(tidyr)
+library(lubridate)
+library(caret)
+library(Metrics)
+library(ggplot2)
+library(reshape2)
+library(glmnet)
+library(pls)
+library(knitr)
+library(tm)
+library(slam)
+library(stringr)
+library(kableExtra)
+library(randomForest)
+
+options(warn = -1)
+preloaded <- TRUE
+```
+
+```{r import_data, include=FALSE}
+if (preloaded) {
+  df2 <- readRDS("cleaned-data.rds")
+} else {
+  # Import the data
+  # df1 <- fromJSON("default-cards-2023-11-25.json")
+  # saveRDS(df1, "default-cards-2023-11-25.rds")
+  df1 <- readRDS("default-cards-2023-11-25.rds")
+  
+  # Massage the data
+  
+  # Select only the columns I want
+  df2 <- select(df1,name,released_at,cmc,type_line,oracle_text,power,toughness,colors,legalities,reserved,set,rarity,booster,edhrec_rank,prices,loyalty)
+  
+  df2$legal_in_standard <- df2$legalities$standard
+  df2$legal_in_pioneer <- df2$legalities$pioneer
+  df2$legal_in_modern <- df2$legalities$modern
+  df2$legal_in_commander <- df2$legalities$commander
+  df2$price <- df2$prices$usd
+  
+  df2$legalities <- NULL
+  df2$prices <- NULL
+  
+  # Ensure that released_at is a date type
+  df2$released_at <- as.Date(df2$released_at)
+  
+  # Count the number of duplicates of each card
+  df2 <- df2 %>%
+    group_by(name) %>%
+    mutate(duplicate_count = n()) %>%
+    ungroup()
+  
+  # Remove duplicate cards while keeping the row with the most recent date
+  df2 <- df2 %>%
+    arrange(desc(released_at)) %>%
+    group_by(name) %>%
+    slice(1) %>%
+    ungroup()
+  
+  # Remove set column now that we have duplicate_count
+  df2$set <- NULL
+  
+  # Remove rows where the price column is NA
+  df2 <- df2 %>% 
+    filter(!is.na(price))
+  
+  # Convert the cmc column from double to integer
+  df2$cmc <- as.integer(df2$cmc)
+  
+  # Change type_line to factor
+  categorize_type_line <- function(type_line) {
+    categories <- c("Token", "Creature", "Planeswalker", "Land", "Artifact", 
+                    "Enchantment", "Instant", "Sorcery", "Battle", "Other")
+    
+    for (category in categories) {
+      if (grepl(category, type_line, ignore.case = TRUE)) {
+        return(category)
+      }
+    }
+    return("Other")
+  }
+  
+  # Apply the function to the type_line column
+  df2$type_category <- sapply(df2$type_line, categorize_type_line)
+  
+  # Convert the type_category column to a factor
+  df2$type_category <- as.factor(df2$type_category)
+  
+  # Remove type_line column now that we have type_category
+  df2$type_line <- NULL
+  
+  # Function to convert to integer or NA
+  convert_to_integer_or_na <- function(x) {
+    # Replace non-numeric values with NA
+    x[!grepl("^[0-9]+$", x)] <- NA
+    # Convert to integer
+    as.integer(x)
+  }
+  
+  # Apply the above function to the power, toughness, and loyalty columns
+  df2$power <- convert_to_integer_or_na(df2$power)
+  df2$toughness <- convert_to_integer_or_na(df2$toughness)
+  df2$loyalty <- convert_to_integer_or_na(df2$loyalty)
+  
+  # Count the number of colors
+  df2$num_colors <- sapply(df2$colors, length)
+  
+  # Remove color column now that we have num_colors
+  df2$colors <- NULL
+  
+  # Convert rarity to a factor
+  df2$rarity <- factor(df2$rarity)
+  
+  # Convert legality to a Boolean
+  df2$legal_in_standard <- df2$legal_in_standard == "legal"
+  df2$legal_in_pioneer <- df2$legal_in_pioneer == "legal"
+  df2$legal_in_modern <- df2$legal_in_modern == "legal"
+  df2$legal_in_commander <- df2$legal_in_commander == "legal"
+  
+  # Convert price to a double type
+  df2$price <- as.numeric(df2$price)
+  
+  # Apply one hot encoding to factor data
+  one_hot_encoded1 <- model.matrix(~ rarity - 1, data = df2)  # -1 to omit intercept
+  one_hot_encoded2 <- model.matrix(~ type_category - 1, data = df2)
+  
+  # To add these back to your data frame
+  df2 <- cbind(df2, one_hot_encoded1)
+  df2 <- cbind(df2, one_hot_encoded2)
+  
+  # Remove the original columns now that we have the encoded columns
+  df2$rarity <- NULL
+  df2$type_category <- NULL
+  
+  # Convert logical columns to 0 and 1
+  df2$reserved <- ifelse(df2$reserved, 1, 0)
+  df2$booster <- ifelse(df2$booster, 1, 0)
+  df2$legal_in_standard <- ifelse(df2$legal_in_standard, 1, 0)
+  df2$legal_in_pioneer <- ifelse(df2$legal_in_pioneer, 1, 0)
+  df2$legal_in_modern <- ifelse(df2$legal_in_modern, 1, 0)
+  df2$legal_in_commander <- ifelse(df2$legal_in_commander, 1, 0)
+  
+  # Truncate date to just include the year
+  df2$year <- year(df2$released_at)
+  df2$released_at <- NULL
+  
+  # Fill missing values with 0
+  df2$power[is.na(df2$power)] <- 0
+  df2$toughness[is.na(df2$toughness)] <- 0
+  df2$edhrec_rank[is.na(df2$edhrec_rank)] <- 0
+  df2$loyalty[is.na(df2$loyalty)] <- 0
+  
+  # Remove rows where any value is NA
+  df2 <- na.omit(df2)
+  
+  saveRDS(df2, "cleaned-data.rds")
+}
+```
+
+```{r make_gpt_csv, echo=FALSE, eval=FALSE}
+df1 <- readRDS("default-cards-2023-11-25.rds")
+  
+# Massage the data
+
+# Select only the columns I want
+df2 <- select(df1,name,released_at,cmc,type_line,oracle_text,power,toughness,colors,legalities,reserved,set,rarity,booster,edhrec_rank,prices,loyalty)
+
+df2$legal_in_standard <- df2$legalities$standard
+df2$legal_in_pioneer <- df2$legalities$pioneer
+df2$legal_in_modern <- df2$legalities$modern
+df2$legal_in_commander <- df2$legalities$commander
+df2$price <- df2$prices$usd
+
+df2$legalities <- NULL
+df2$prices <- NULL
+
+# Ensure that released_at is a date type
+df2$released_at <- as.Date(df2$released_at)
+
+# Count the number of duplicates of each card
+df2 <- df2 %>%
+  group_by(name) %>%
+  mutate(duplicate_count = n()) %>%
+  ungroup()
+
+# Remove duplicate cards while keeping the row with the most recent date
+df2 <- df2 %>%
+  arrange(desc(released_at)) %>%
+  group_by(name) %>%
+  slice(1) %>%
+  ungroup()
+
+# Remove rows where the price column is NA
+df2 <- df2 %>% 
+  filter(!is.na(price))
+
+# Convert the cmc column from double to integer
+df2$cmc <- as.integer(df2$cmc)
+
+# Function to convert to integer or NA
+convert_to_integer_or_na <- function(x) {
+  # Replace non-numeric values with NA
+  x[!grepl("^[0-9]+$", x)] <- NA
+  # Convert to integer
+  as.integer(x)
+}
+
+# Apply the above function to the power, toughness, and loyalty columns
+df2$power <- convert_to_integer_or_na(df2$power)
+df2$toughness <- convert_to_integer_or_na(df2$toughness)
+df2$loyalty <- convert_to_integer_or_na(df2$loyalty)
+
+# Convert rarity to a factor
+df2$rarity <- factor(df2$rarity)
+
+# Convert price to a double type
+df2$price <- as.numeric(df2$price)
+
+df2 <- select(df2,name,cmc,type_line,oracle_text,power,toughness,rarity,price,loyalty,duplicate_count)
+
+# Train test split
+set.seed(123)
+splitIndex <- createDataPartition(df2$price, p = 0.80, list = FALSE)
+df2_train <- df2[splitIndex,]
+df2 <- df2[-splitIndex,]
+
+# ------------------------------------------------------------------------------
+
+# Open a file connection for writing
+file_conn <- file("trading_cards_test.jsonl", "w")
+
+# Iterate through each row of df2
+for (i in 1:nrow(df2)) {
+  # Construct user content string
+  user_content <- paste("Guess the price of a trading card with the following statistics...\nName:", df2$name[i],
+                        "\nCost:", df2$cmc[i],
+                        "\nType:", df2$type_line[i],
+                        "\nText:", df2$oracle_text[i],
+                        "\nNumber of Printings:", df2$duplicate_count[i],
+                        if (!is.na(df2$power[i])) paste("\nPower:", df2$power[i]) else "",
+                        if (!is.na(df2$toughness[i])) paste("\nToughness:", df2$toughness[i]) else "",
+                        if (!is.na(df2$loyalty[i])) paste("\nLoyalty:", df2$loyalty[i]) else "",
+                        sep="")
+
+  # Construct a single conversation
+  single_conversation <- list(
+    list(role = "system", content = "You are an expert AI system trained in predicting the price of trading cards."),
+    list(role = "user", content = user_content),
+    list(role = "assistant", content = as.character(df2$price[i]))
+  )
+
+  # Convert the single conversation to JSON
+  json_line <- toJSON(list(messages = single_conversation), auto_unbox = TRUE)
+
+  # Write the JSON line to file
+  writeLines(json_line, file_conn)
+}
+
+# Close the file connection
+close(file_conn)
+```
+
+```{r print_table, echo=FALSE, results='asis'}
+# Select the first 5 rows
+df2 <- head(df2, 5)
+
+# Number of columns in each part
+cols_per_part <- ncol(df2) / 4
+
+# Truncate strings longer than 15 characters
+df2 <- df2 %>% mutate(across(everything(), ~ifelse(nchar(as.character(.)) > 15, paste0(substr(as.character(.), 1, 15), "..."), .)))
+
+# Creating 4 parts
+part1 <- df2[ , 1:ceiling(cols_per_part*1)]
+part2 <- df2[ , (ceiling(cols_per_part*1)+1):ceiling(cols_per_part*2)]
+part3 <- df2[ , (ceiling(cols_per_part*2)+1):ceiling(cols_per_part*3)]
+part4 <- df2[ , (ceiling(cols_per_part*3)+1):ncol(df2)]
+
+# Display tables
+kable(part1, format = "html") %>% kable_styling()
+cat("<br><br>")
+kable(part2, format = "html") %>% kable_styling()
+cat("<br><br>")
+kable(part3, format = "html") %>% kable_styling()
+cat("<br><br>")
+kable(part4, format = "html") %>% kable_styling()
+
+# Reload data
+df2 <- readRDS("cleaned-data.rds")
+```
+
+```{r plot_prices, echo=FALSE}
+# Create the histogram with a logarithmic y-axis
+ggplot(df2, aes(x = price)) +
+  geom_histogram(binwidth = 10, fill = "aquamarine1", color = "black") +
+  scale_y_log10() +  # Set y-axis to logarithmic scale
+  labs(title = "Histogram of Prices", x = "Price", y = "Frequency (Log Scale)")
+```
+
+# Different NLP Techniques
+
+```{r make_categorical, eval=FALSE, echo=FALSE}
+df2$price <- ifelse(df2$price < 5, 0, 1)
+```
+
+```{r define_functions, echo=FALSE}
+process_with_word_counting <- function(df_in) {
+  # METHOD 1 - Word Counting
+
+  # Define a function to count words
+  count_words <- function(text) {
+    length(strsplit(as.character(text), "\\s+")[[1]])
+  }
+  
+  # Add a new column with word counts
+  df3 <- df_in %>% 
+    mutate(word_count = sapply(oracle_text, count_words))
+  
+  # Drop oracle_text and name
+  df3$oracle_text <- NULL
+  df3$name <- NULL
+    
+  return(df3)
+}
+
+process_with_phrase_counting <- function(df_in) {
+  # METHOD - Count "draw a card" Occurrences
+
+  # Define a function to count occurrences of "draw a card"
+  count_draw_a_card <- function(text) {
+    sum(grepl("draw a card", tolower(text), fixed = TRUE))
+  }
+  
+  # Add a new column with "draw a card" counts
+  df_out <- df_in %>% 
+    mutate(draw_a_card_count = sapply(oracle_text, count_draw_a_card))
+  
+  # Drop oracle_text and name (if required)
+  df_out$oracle_text <- NULL
+  df_out$name <- NULL
+    
+  return(df_out)
+}
+
+process_with_tfidf <- function(df_in) {
+  # METHOD 2 - TF-IDF
+  
+  # Apply TF-IDF
+  temp1 <- df_in %>%
+    unnest_tokens(word, oracle_text) %>%
+    count(name, word) %>%
+    bind_tf_idf(word, name, n)
+  
+  # Aggregate TF-IDF scores and add them to the main data set
+  temp2 <- temp1 %>%
+    select(-word) %>%  # Exclude the non-numeric 'word' column
+    group_by(name) %>%
+    summarize_all(mean) # I tried sum and max, but they were about the same
+  
+  df3 <- merge(df_in, temp2, by = "name")
+  
+  # Drop oracle_text and name
+  df3$oracle_text <- NULL
+  df3$name <- NULL
+    
+  return(df3)
+}
+
+process_with_bow <- function(df_in) {
+  # Rename columns to prevent errors later on
+  df_in <- rename(df_in, card_power = power)
+  df_in <- rename(df_in, card_toughness = toughness)
+  
+  # Create a Corpus from the text column
+  corpus <- Corpus(VectorSource(df_in$oracle_text))
+  
+  # Preprocessing: cleaning up the text data
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeNumbers)
+  corpus <- tm_map(corpus, removeWords, stopwords("english"))
+  corpus <- tm_map(corpus, stripWhitespace)
+  
+  # Creating a Document-Term Matrix (Bag of Words)
+  dtm <- DocumentTermMatrix(corpus)
+  
+  # Converting the Document-Term Matrix into a data frame
+  bow_df <- as.data.frame(as.matrix(dtm))
+  
+  # Calculate variance for each feature
+  feature_variance <- apply(bow_df, 2, var)
+  
+  # Set a threshold for variance
+  variance_threshold <- 1e-2
+  
+  # Identify features with variance above the threshold
+  high_variance_features <- names(feature_variance[feature_variance > variance_threshold])
+  
+  # Filter the dataset to keep only high variance features
+  reduced_bow_df <- bow_df[, high_variance_features]
+  
+  # Viewing the result
+  # head(reduced_bow_df)
+  
+  # Look at PCA bar plot
+  # pca = prcomp(reduced_bow_df)
+  # plot(pca, main="Variation explained by each PC")
+  
+  # Merge the data frames
+  df3 <- cbind(df_in, reduced_bow_df)
+  
+  # Drop oracle_text and name
+  df3$oracle_text <- NULL
+  df3$name <- NULL
+
+  return(df3)
+}
+
+process_with_bow <- function(df_in) {
+  # Rename columns to prevent errors later on
+  df_in <- rename(df_in, card_power = power)
+  df_in <- rename(df_in, card_toughness = toughness)
+  
+  # Create a Corpus from the text column
+  corpus <- Corpus(VectorSource(df_in$oracle_text))
+  
+  # Preprocessing: cleaning up the text data
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeNumbers)
+  corpus <- tm_map(corpus, removeWords, stopwords("english"))
+  corpus <- tm_map(corpus, stripWhitespace)
+  
+  # Creating a Document-Term Matrix (Bag of Words)
+  dtm <- DocumentTermMatrix(corpus)
+  
+  # Converting the Document-Term Matrix into a data frame
+  bow_df <- as.data.frame(as.matrix(dtm))
+  
+  # Calculate variance for each feature
+  feature_variance <- apply(bow_df, 2, var)
+  
+  # Set a threshold for variance
+  variance_threshold <- 1e-2
+  
+  # Identify features with variance above the threshold
+  high_variance_features <- names(feature_variance[feature_variance > variance_threshold])
+  
+  # Filter the dataset to keep only high variance features
+  reduced_bow_df <- bow_df[, high_variance_features]
+  
+  # Viewing the result
+  # head(reduced_bow_df)
+  
+  # Look at PCA bar plot
+  # pca = prcomp(reduced_bow_df)
+  # plot(pca, main="Variation explained by each PC")
+  
+  # Merge the data frames
+  df3 <- cbind(df_in, reduced_bow_df)
+  
+  # Drop oracle_text and name
+  df3$oracle_text <- NULL
+  df3$name <- NULL
+
+  return(df3)
+}
+
+train_and_evaluate_model <- function(train, test, model_type) {
+  # Selecting columns for x and y
+  x <- train %>% select(-price) %>% as.matrix()
+  xtest <- test %>% select(-price) %>% as.matrix()
+  y <- train$price
+  ytest <- test$price
+  
+  # Because BOW was run of test and train separately we need to drop differing columns
+  # This should have no effect unless BOW is the method being used
+  different_in_x <- setdiff(colnames(x), colnames(xtest))
+  different_in_xtest <- setdiff(colnames(xtest), colnames(x))
+  x <- x[, !(colnames(x) %in% different_in_x)]
+  xtest <- xtest[, !(colnames(xtest) %in% different_in_xtest)]
+  
+  if (model_type == "lasso") {
+    lasso_model <- cv.glmnet(x, y, alpha = 1)
+
+    lasso_pred <- predict(lasso_model, s = "lambda.min", newx = xtest)
+    
+    mse <- mean((lasso_pred - ytest)^2)
+    
+  } else if (model_type == "ridge") {
+    ridge_model <- cv.glmnet(x, y, alpha = 0)
+
+    ridge_pred <- predict(ridge_model, s = "lambda.min", newx = xtest)
+    
+    mse <- mean((ridge_pred - ytest)^2)
+    
+  } else if (model_type == "pcr") {
+    # Define the control for cross-validation
+    ctrl <- trainControl(method = "cv", number = 10) # 10-fold cross-validation
+    
+    # Train the PCR model
+    pcr_model <- train(x, y, method = "pcr",
+                       preProcess = "scale", # Scale features
+                       tuneLength = 20,      # Number of components to consider
+                       trControl = ctrl)
+    
+    # Best number of components
+    best_components <- pcr_model$bestTune$ncomp
+    
+    # Predict on test data
+    predictions <- predict(pcr_model, xtest)
+    
+    # Calculate the testing error, here using Mean Squared Error (MSE)
+    mse <- mean((predictions - ytest)^2)
+    
+  } else if (model_type == "pls") {
+    # Define the control for cross-validation
+    ctrl <- trainControl(method = "cv", number = 10) # 10-fold cross-validation
+    
+    # Train the PLS model
+    pls_model <- train(x, y, method = "pls",
+                       preProcess = "scale", # Scale features
+                       tuneLength = 20,      # Number of components to consider
+                       trControl = ctrl)
+    
+    # Best number of components
+    best_components <- pls_model$bestTune$ncomp
+    
+    # Predict on test data
+    predictions <- predict(pls_model, xtest)
+    
+    # Calculate the testing error, here using Mean Squared Error (MSE)
+    mse <- mean((predictions - ytest)^2)
+    
+  } else {
+    print("Enter a valid model_type: lasso, ridge, pcr, or pls")
+    
+    mse <- NULL
+  }
+
+  return(mse)
+}
+```
+
+```{r compare_nlp, echo=FALSE, eval=FALSE}
+# Common Train-Test Split
+set.seed(123)
+splitIndex <- createDataPartition(df2$price, p = 0.80, list = FALSE)
+train_set <- df2[splitIndex,]
+test_set <- df2[-splitIndex,]
+
+# Find the MSE of the mean as a baseline
+print(paste("Baseline MSE:", mean((test_set$price - mean(train_set$price))^2)))
+
+# Word Counting
+train <- process_with_word_counting(train_set)
+test <- process_with_word_counting(test_set)
+
+model_result <- train_and_evaluate_model(train, test, "lasso")
+print(paste("Word Counting Lasso MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "ridge")
+print(paste("Word Counting Ridge MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pcr")
+print(paste("Word Counting PCR MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pls")
+print(paste("Word Counting PLS MSE:", model_result))
+
+# TF-IDF
+train <- process_with_tfidf(train_set)
+test <- process_with_tfidf(test_set)
+
+model_result <- train_and_evaluate_model(train, test, "lasso")
+print(paste("TF-IDF Lasso MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "ridge")
+print(paste("TF-IDF Ridge MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pcr")
+print(paste("TF-IDF PCR MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pls")
+print(paste("TF-IDF PLS MSE:", model_result))
+
+# BOW
+train <- process_with_bow(train_set)
+test <- process_with_bow(test_set)
+
+model_result <- train_and_evaluate_model(train, test, "lasso")
+print(paste("BOW Lasso MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "ridge")
+print(paste("BOW Ridge MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pcr")
+print(paste("BOW PCR MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pls")
+print(paste("BOW PLS MSE:", model_result))
+
+# Phrase Counting
+train <- process_with_phrase_counting(train_set)
+test <- process_with_phrase_counting(test_set)
+
+model_result <- train_and_evaluate_model(train, test, "lasso")
+print(paste("Phrase Counting Lasso MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "ridge")
+print(paste("Phrase Counting Ridge MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pcr")
+print(paste("Phrase Counting PCR MSE:", model_result))
+
+model_result <- train_and_evaluate_model(train, test, "pls")
+print(paste("Phrase Counting PLS MSE:", model_result))
+```
+
+```{r plot_results, echo=FALSE}
+# Data from compare_nlp cell
+techniques <- c("Baseline", "Word Counting Lasso", "Word Counting Ridge", 
+                "Word Counting PCR", "Word Counting PLS", "TF-IDF Lasso",
+                "TF-IDF Ridge", "TF-IDF PCR", "TF-IDF PLS", "BOW Lasso",
+                "BOW Ridge", "BOW PCR", "BOW PLS", "Phrase Counting Lasso", 
+                "Phrase Counting Ridge", "Phrase Counting PCR", 
+                "Phrase Counting PLS")
+
+mse_values <- c(171.834406309152, 163.690160633746, 163.328951056775,
+                164.237190138679, 163.831646367188, 165.743316405828,
+                165.24698896036, 166.172139736872, 166.007951972544,
+                165.652069004969, 167.855764957472, 168.710921297407,
+                167.157227638705, 163.637966734112, 163.329505112331, 
+                163.904074182848, 163.822608949382)
+
+data <- data.frame(Technique = techniques, MSE = mse_values)
+
+# Simplify technique names for x-axis labels
+data$SimpleTechnique <- gsub(".*(Lasso|Ridge|PCR|PLS)$", "\\1", data$Technique)
+data$SimpleTechnique[data$Technique == "Baseline"] <- "Baseline"
+
+# Create subsets
+word_counting <- subset(data, Technique %in% c("Baseline", "Word Counting Lasso", 
+                                               "Word Counting Ridge", "Word Counting PCR", 
+                                               "Word Counting PLS"))
+tfidf <- subset(data, Technique %in% c("Baseline", "TF-IDF Lasso", 
+                                       "TF-IDF Ridge", "TF-IDF PCR", "TF-IDF PLS"))
+bow <- subset(data, Technique %in% c("Baseline", "BOW Lasso", 
+                                     "BOW Ridge", "BOW PCR", "BOW PLS"))
+phrase_counting <- subset(data, Technique %in% c("Baseline", "Phrase Counting Lasso", 
+                                               "Phrase Counting Ridge", 
+                                               "Phrase Counting PCR", 
+                                               "Phrase Counting PLS"))
+
+# Create a function to plot data
+plot_data <- function(subset_data, title) {
+  ggplot(subset_data, aes(x = SimpleTechnique, y = MSE, fill = SimpleTechnique)) +
+    geom_bar(stat = "identity", fill = c("darkslategray", "darkcyan", "darkmagenta", "deepskyblue4", "darkslateblue")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+    labs(title = title, x = "Method", y = "MSE")
+}
+
+# Plot each group
+plot_data(word_counting, "Word Counting\n")
+plot_data(phrase_counting, "Phrase Counting\n")
+plot_data(tfidf, "TF-IDF\n")
+plot_data(bow, "Bag of Words\n")
+```
+
+```{r plot_categorical, echo=FALSE}
+# Your provided data
+techniques <- c("Baseline", "Word Counting Lasso", "Word Counting Ridge", 
+                "TF-IDF Lasso", "TF-IDF Ridge", "BOW Lasso", "BOW Ridge", 
+                "Phrase Counting Lasso", "Phrase Counting Ridge")
+
+mse_values <- c(0.0473310108744731, 0.0402898967282581, 0.0403062866690266, 
+                0.0398650549652967, 0.0398722701855441, 0.0420668757654017, 
+                0.0431334562334018, 0.0404064983404517, 0.0404145860362857)
+
+# Create a data frame
+data <- data.frame(Technique = techniques, MSE = mse_values)
+
+# Simplify technique names for x-axis labels
+data$SimpleTechnique <- gsub(".*(Lasso|Ridge)$", "\\1", data$Technique)
+data$SimpleTechnique[data$Technique == "Baseline"] <- "Baseline"
+
+# Create subsets
+word_counting <- subset(data, Technique %in% c("Baseline", "Word Counting Lasso", 
+                                               "Word Counting Ridge"))
+tfidf <- subset(data, Technique %in% c("Baseline", "TF-IDF Lasso", 
+                                       "TF-IDF Ridge"))
+bow <- subset(data, Technique %in% c("Baseline", "BOW Lasso", 
+                                     "BOW Ridge"))
+phrase_counting <- subset(data, Technique %in% c("Baseline", "Phrase Counting Lasso", 
+                                                 "Phrase Counting Ridge"))
+
+# Create a function to plot data
+plot_data <- function(subset_data, title) {
+  ggplot(subset_data, aes(x = SimpleTechnique, y = MSE, fill = SimpleTechnique)) +
+    geom_bar(stat = "identity", fill = c("darkslategray", "darkcyan", "deepskyblue4")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+    labs(title = title, x = "Method", y = "MSE")
+}
+
+# Plot each group
+plot_data(word_counting, "Word Counting\n")
+plot_data(phrase_counting, "Phrase Counting\n")
+plot_data(tfidf, "TF-IDF\n")
+plot_data(bow, "Bag of Words\n")
+```
+
+```{r random_forest, echo=FALSE}
+# Common Train-Test Split
+set.seed(123)
+splitIndex <- createDataPartition(df2$price, p = 0.80, list = FALSE)
+train_set <- df2[splitIndex,]
+test_set <- df2[-splitIndex,]
+
+train <- process_with_word_counting(train_set)
+test <- process_with_word_counting(test_set)
+
+# Other parts of your code remain the same
+
+# Assuming the target variable is 'price'
+rf_model <- randomForest(price ~ ., data=train_set)
+
+# Make predictions on the test set
+predictions <- predict(rf_model, test_set)
+
+# Calculate MAE
+mae <- mean(abs(predictions - test_set$price))
+
+# Calculate RMSE
+rmse <- sqrt(mean((predictions - test_set$price)^2))
+
+# Calculate R-squared
+r_squared <- summary(lm(predictions ~ test_set$price))$r.squared
+
+# Print the metrics
+print(paste("MAE:", mae))
+print(paste("RMSE:", rmse))
+print(paste("R-squared:", r_squared))
+
+# ------------------------------------------------------------------------------
+
+# Tune the model
+tuned_rf <- randomForest(price ~ ., data=train_set, ntree=1000, mtry=5, nodesize=5)
+
+# Make predictions on the test set
+predictions <- predict(tuned_rf, test_set)
+
+# Calculate MAE
+mae <- mean(abs(predictions - test_set$price))
+
+# Calculate RMSE
+rmse <- sqrt(mean((predictions - test_set$price)^2))
+
+# Calculate R-squared
+r_squared <- summary(lm(predictions ~ test_set$price))$r.squared
+
+# Print the metrics
+print(paste("MAE:", mae))
+print(paste("RMSE:", rmse))
+print(paste("R-squared:", r_squared))
+
+# ------------------------------------------------------------------------------
+
+# Data from compare_nlp cell
+techniques <- c("Baseline", "Word Counting Lasso", "Word Counting Ridge", 
+                "Word Counting PCR", "Word Counting PLS", "Word Counting Random Forest")
+
+mse_values <- c(171.834406309152, 163.690160633746, 163.328951056775,
+                164.237190138679, 163.831646367188, (11.8805837794332^2))
+
+data <- data.frame(Technique = techniques, MSE = mse_values)
+
+# Simplify technique names for x-axis labels
+data$SimpleTechnique <- gsub(".*(Lasso|Ridge|PCR|PLS|Random Forest)$", "\\1", data$Technique)
+data$SimpleTechnique[data$Technique == "Baseline"] <- "Baseline"
+
+# Create subsets
+word_counting <- subset(data, Technique %in% c("Baseline", "Word Counting Lasso", 
+                                               "Word Counting Ridge", "Word Counting PCR", 
+                                               "Word Counting PLS", "Word Counting Random Forest"))
+
+# Create a function to plot data
+plot_data <- function(subset_data, title) {
+  ggplot(subset_data, aes(x = SimpleTechnique, y = MSE, fill = SimpleTechnique)) +
+    geom_bar(stat = "identity", fill = c("darkslategray", "darkcyan", "darkmagenta", "deepskyblue4", "darkslateblue", "black")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+    labs(title = title, x = "Method", y = "MSE")
+}
+
+# Plot each group
+plot_data(word_counting, "Word Counting\n")
+
+# ------------------------------------------------------------------------------
+
+# Next step, run Random Forest on categorical data, and write conclusions
+```
